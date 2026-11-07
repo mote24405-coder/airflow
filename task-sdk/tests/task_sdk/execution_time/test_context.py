@@ -3209,6 +3209,16 @@ class TestBuildDeadlineCallbackContext:
         assert context["callback"] == CallbackMeta(source=CallbackSource.DEADLINE)
         assert "deadline" not in context
 
+    def test_keys_are_known_context_keys(self):
+        from airflow.sdk import DAG
+        from airflow.sdk.definitions.context import KNOWN_CONTEXT_KEYS
+
+        context = build_deadline_callback_context(
+            _dag_run(), DAG("ctx_dag"), deadline_id="abc", deadline_time="2024-06-15T13:00:00+00:00"
+        )
+
+        assert set(context) <= KNOWN_CONTEXT_KEYS
+
 
 class TestRenderCallbackKwargs:
     @staticmethod

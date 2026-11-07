@@ -21,12 +21,15 @@ import inspect
 import logging
 import traceback
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from airflow._shared.module_loading import accepts_context, import_string, qualname
 from airflow.models.callback import CallbackState
 from airflow.sdk.execution_time.context import render_callback_kwargs  # noqa: SDK001
 from airflow.triggers.base import BaseTrigger, TriggerEvent
+
+if TYPE_CHECKING:
+    from airflow.sdk.definitions.context import Context  # noqa: SDK001
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +80,7 @@ class CallbackTrigger(BaseTrigger):
         # Read by Trigger.from_object() when persisting the row; unused once running.
         self.queue = queue
         # Set by the TriggerRunner before run(), like task_instance on task-bound triggers. Not serialized.
-        self._callback_context: dict | None = None
+        self._callback_context: Context | None = None
 
     def serialize(self) -> tuple[str, dict[str, Any]]:
         return (

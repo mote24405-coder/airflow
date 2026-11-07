@@ -6,3 +6,5 @@ context, without the task fields, instead of being stored by the scheduler when 
 fields, so read its fields as attributes (``context["dag_run"].dag_id``), and ``context["deadline"]["deadline_time"]``
 is a datetime. The kwargs of function callbacks are rendered as Jinja templates with this context, the way
 ``PythonOperator`` renders ``op_kwargs``. Callbacks queued before the upgrade still run with their stored context.
+``deadline`` is now a context key, so, like ``ds`` or ``params``, a ``@task`` argument with that name can only
+default to ``None``.

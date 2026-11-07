@@ -77,6 +77,8 @@ class Context(TypedDict, total=False):
     dag_run: DagRunProtocol
     data_interval_end: NotRequired[DateTime | None]
     data_interval_start: NotRequired[DateTime | None]
+    # Only in deadline callbacks: ``{"id": ..., "deadline_time": ...}``.
+    deadline: NotRequired[dict[str, Any]]
     outlet_events: OutletEventAccessorsProtocol
     ds: str
     ds_nodash: str

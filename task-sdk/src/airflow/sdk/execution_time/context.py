@@ -1821,7 +1821,7 @@ def build_deadline_callback_context(
     deadline_id: str | None,
     deadline_time: str | datetime | None,
     multi_team: bool = False,
-) -> dict[str, Any]:
+) -> Context:
     """
     Build the context of a deadline callback: a task's context without the task keys.
 
@@ -1831,7 +1831,7 @@ def build_deadline_callback_context(
     from airflow.sdk.definitions.context import CallbackMeta, CallbackSource
     from airflow.sdk.timezone import coerce_datetime
 
-    context: dict[str, Any] = dict(build_dag_run_context(dag_run, dag, multi_team=multi_team))
+    context = build_dag_run_context(dag_run, dag, multi_team=multi_team)
     context["callback"] = CallbackMeta(source=CallbackSource.DEADLINE)
     if deadline_id:
         if isinstance(deadline_time, str):

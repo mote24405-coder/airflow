@@ -1674,7 +1674,7 @@ class TriggerRunner:
         )
 
     @staticmethod
-    def _build_callback_context(dag_run_data: dict, encoded_dag: dict | None) -> dict[str, Any]:
+    def _build_callback_context(dag_run_data: dict, encoded_dag: dict | None) -> Context:
         """Build the context of a callback trigger from the Dag run and serialized Dag on its workload."""
         from airflow.api_fastapi.execution_api.datamodels.taskinstance import DagRun as DRDataModel
 
