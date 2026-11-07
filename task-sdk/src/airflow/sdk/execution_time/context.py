@@ -1812,3 +1812,29 @@ def build_dag_run_context(
         context["params"] = process_params(dag, None, dag_run.conf, suppress_exception=False)
 
     return context
+
+
+def build_deadline_callback_context(
+    dag_run: DagRunProtocol,
+    dag: DAG | None = None,
+    *,
+    deadline_id: str | None,
+    deadline_time: str | datetime | None,
+    multi_team: bool = False,
+) -> dict[str, Any]:
+    """
+    Build the context of a deadline callback: a task's context without the task keys.
+
+    ``deadline_time`` is stored as an ISO string so it can travel in the workload JSON, and is turned
+    back into an aware datetime here, so callbacks and templates get the same type as ``logical_date``.
+    """
+    from airflow.sdk.definitions.context import CallbackMeta, CallbackSource
+    from airflow.sdk.timezone import coerce_datetime
+
+    context: dict[str, Any] = dict(build_dag_run_context(dag_run, dag, multi_team=multi_team))
+    context["callback"] = CallbackMeta(source=CallbackSource.DEADLINE)
+    if deadline_id:
+        if isinstance(deadline_time, str):
+            deadline_time = datetime.fromisoformat(deadline_time)
+        context["deadline"] = {"id": deadline_id, "deadline_time": coerce_datetime(deadline_time)}
+    return context

@@ -115,6 +115,7 @@ from airflow.sdk.execution_time.context import (
     _process_connection_result_conn,
     _wrap_external_ref,
     build_dag_run_context,
+    build_deadline_callback_context,
     context_to_airflow_vars,
     set_current_context,
 )
@@ -3179,3 +3180,31 @@ class TestBuildDagRunContext:
 
         assert context["dag"] is dag
         assert context["params"] == {"x": 2, "y": "a"}
+
+
+class TestBuildDeadlineCallbackContext:
+    @pytest.mark.parametrize(
+        "deadline_time",
+        ["2024-06-15T13:00:00+00:00", "2024-06-15T15:00:00+02:00", timezone.datetime(2024, 6, 15, 13)],
+        ids=["utc-string", "offset-string", "datetime"],
+    )
+    def test_deadline_time_is_an_aware_datetime(self, deadline_time):
+        """deadline_time travels as an ISO string in the workload JSON and is a datetime again here."""
+        context = build_deadline_callback_context(_dag_run(), deadline_id="abc", deadline_time=deadline_time)
+
+        built = context["deadline"]["deadline_time"]
+        assert isinstance(built, datetime)
+        # The same type as logical_date, so filters and date math treat them alike.
+        assert type(built) is type(context["logical_date"])
+        assert built.tzinfo is not None
+        assert built == timezone.datetime(2024, 6, 15, 13)
+        assert built - timedelta(hours=1) == timezone.datetime(2024, 6, 15, 12)
+        assert context["deadline"]["id"] == "abc"
+
+    def test_callback_source_is_deadline(self):
+        from airflow.sdk import CallbackMeta, CallbackSource
+
+        context = build_deadline_callback_context(_dag_run(), deadline_id=None, deadline_time=None)
+
+        assert context["callback"] == CallbackMeta(source=CallbackSource.DEADLINE)
+        assert "deadline" not in context

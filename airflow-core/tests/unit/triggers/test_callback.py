@@ -22,6 +22,7 @@ from unittest import mock
 
 import pytest
 
+from airflow._shared.timezones import timezone
 from airflow.models.callback import CallbackState
 from airflow.sdk import BaseNotifier
 from airflow.triggers.callback import (
@@ -263,3 +264,46 @@ class TestCallbackTrigger:
         assert calls == []
         assert failure_event.payload[PAYLOAD_STATUS_KEY] == CallbackState.FAILED
         assert "InvalidCallbackPathError" in failure_event.payload[PAYLOAD_BODY_KEY]
+
+
+class TestCallbackTriggerContext:
+    STORED = {"dag_id": "stored"}
+    RUNTIME = {"dag_id": "my_dag", "logical_date": timezone.datetime(2024, 6, 15)}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("callback_kwargs", "runtime_context", "expected_call"),
+        [
+            pytest.param(
+                {"message": "{{ dag_id }}"},
+                RUNTIME,
+                {"message": "{{ dag_id }}", "context": RUNTIME},
+                id="passes-runtime-context",
+            ),
+            pytest.param(
+                {"message": "{{ dag_id }}", "context": STORED},
+                RUNTIME,
+                {"message": "{{ dag_id }}", "context": RUNTIME},
+                id="prefers-runtime-over-stored-context",
+            ),
+            pytest.param(
+                {"message": "{{ dag_id }}", "context": STORED},
+                None,
+                {"message": "{{ dag_id }}", "context": STORED},
+                id="stored-context",
+            ),
+            pytest.param({"message": "{{ dag_id }}"}, None, {"message": "{{ dag_id }}"}, id="no-context"),
+        ],
+    )
+    async def test_run_passes_context(self, callback_kwargs, runtime_context, expected_call):
+        trigger = CallbackTrigger(callback_path=TEST_CALLBACK_PATH, callback_kwargs=dict(callback_kwargs))
+        trigger._callback_context = runtime_context
+
+        mock_callback = mock.AsyncMock(return_value="ok")
+        with mock.patch("airflow.triggers.callback.import_string", return_value=mock_callback):
+            events = [event async for event in trigger.run()]
+
+        assert events[-1].payload[PAYLOAD_STATUS_KEY] == CallbackState.SUCCESS
+        mock_callback.assert_called_once_with(**expected_call)
+        # The trigger may be serialized again, so its kwargs are left as they were.
+        assert trigger.callback_kwargs == callback_kwargs

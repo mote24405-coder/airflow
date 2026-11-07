@@ -31,8 +31,9 @@ from unittest.mock import ANY, Mock, patch
 import pytest
 import structlog
 
+from airflow.sdk import CallbackMeta, CallbackSource, timezone
 from airflow.sdk.api.client import CallbackOperations, Client
-from airflow.sdk.api.datamodels._generated import CallbackTerminalState, XComResponse
+from airflow.sdk.api.datamodels._generated import CallbackTerminalState, DagRunState, DagRunType, XComResponse
 from airflow.sdk.execution_time.callback_supervisor import (
     CallbackSubprocess,
     Path,
@@ -42,7 +43,9 @@ from airflow.sdk.execution_time.callback_supervisor import (
 from airflow.sdk.execution_time.comms import (
     BundleInfo,
     ConnectionResult,
+    DagRunResult,
     GetConnection,
+    GetDagRun,
     GetVariable,
     GetVariableKeys,
     GetXCom,
@@ -54,6 +57,21 @@ from airflow.sdk.execution_time.comms import (
 )
 
 from tests_common.test_utils.config import conf_vars
+
+DAG_RUN = DagRunResult(
+    dag_id="ctx_dag",
+    run_id="ctx_run",
+    logical_date=timezone.datetime(2024, 6, 15, 12, 30),
+    data_interval_start=timezone.datetime(2024, 6, 15),
+    data_interval_end=timezone.datetime(2024, 6, 16),
+    run_after=timezone.datetime(2024, 6, 16),
+    start_date=timezone.datetime(2024, 6, 15, 12, 30),
+    end_date=None,
+    partition_key=None,
+    run_type=DagRunType.SCHEDULED,
+    state=DagRunState.RUNNING,
+    consumed_asset_events=[],
+)
 
 
 def callback_no_args():
@@ -360,6 +378,15 @@ class TestCallbackHandleRequest:
             message=MaskSecret(value="super_secret", name="api_key"),
             test_id="mask_secret",
             mask_secret_args=("super_secret", "api_key"),
+        ),
+        RequestCase(
+            message=GetDagRun(dag_id="ctx_dag", run_id="ctx_run"),
+            test_id="get_dag_run",
+            client_mock=ClientMock(
+                method_path="dag_runs.get_detail",
+                args=("ctx_dag", "ctx_run"),
+                response=DAG_RUN,
+            ),
         ),
     ]
 
@@ -873,3 +900,71 @@ class TestSuperviseCallbackReportsTerminalState:
         mock_start.return_value = Mock(wait=Mock(return_value=0))
 
         assert self._supervise(client) == 0
+
+
+class TestCallbackContextFetch:
+    """The subprocess target builds the context from the Dag run."""
+
+    @pytest.fixture(autouse=True)
+    def base_mocks_setup(self):
+        with (
+            patch("airflow.sdk.execution_time.comms.CommsDecoder") as mock_comms,
+            patch("airflow.sdk.execution_time.callback_supervisor.WatchedSubprocess.start") as mock_super,
+            patch("airflow.sdk.execution_time.callback_supervisor.execute_callback") as mock_execute,
+        ):
+            mock_execute.return_value = (True, None)
+            # The target replaces SUPERVISOR_COMMS with a new CommsDecoder[...](...) instance.
+            self.mock_comms_instance = mock_comms.__getitem__.return_value.return_value
+            self.mock_super_start = mock_super
+            self.mock_execute_callback = mock_execute
+            yield
+
+    def _start_and_run_target(self, **overrides):
+        CallbackSubprocess.start(
+            **{
+                "id": str(uuid.uuid4()),
+                "callback_path": "my_module.my_callback",
+                "callback_kwargs": {"message": "{{ dag_run.dag_id }} {{ logical_date | ds_nodash }}"},
+                "dag_rel_path": Path("dags/my_dag.py"),
+                "client": Mock(),
+                **overrides,
+            }
+        )
+        self.mock_super_start.call_args.kwargs["target"]()
+
+    def test_builds_context_from_the_dag_run(self):
+        self.mock_comms_instance.send.return_value = DAG_RUN
+
+        self._start_and_run_target(
+            dag_id="ctx_dag", run_id="ctx_run", deadline_id="abc", deadline_time="2024-06-15T13:00:00+00:00"
+        )
+
+        self.mock_comms_instance.send.assert_called_once_with(GetDagRun(dag_id="ctx_dag", run_id="ctx_run"))
+        call = self.mock_execute_callback.call_args.kwargs
+        assert call["callback_kwargs"]["message"] == "{{ dag_run.dag_id }} {{ logical_date | ds_nodash }}"
+        context = call["callback_kwargs"]["context"]
+        assert context["ds"] == "2024-06-15"
+        assert context["callback"] == CallbackMeta(source=CallbackSource.DEADLINE)
+        assert context["deadline"] == {"id": "abc", "deadline_time": timezone.datetime(2024, 6, 15, 13)}
+        assert callable(context["xcom_pull"])
+
+    @pytest.mark.parametrize(
+        "send",
+        [Mock(side_effect=RuntimeError("API down")), Mock(return_value=object())],
+        ids=["error", "bad"],
+    )
+    def test_exits_when_the_dag_run_cannot_be_fetched(self, send):
+        self.mock_comms_instance.send = send
+
+        with pytest.raises(SystemExit) as exc_info:
+            self._start_and_run_target(dag_id="ctx_dag", run_id="ctx_run")
+
+        assert exc_info.value.code == 1
+        self.mock_execute_callback.assert_not_called()
+
+    def test_no_fetch_without_dag_run_ids(self):
+        self._start_and_run_target()
+
+        self.mock_comms_instance.send.assert_not_called()
+        call = self.mock_execute_callback.call_args.kwargs
+        assert call["callback_kwargs"] == {"message": "{{ dag_run.dag_id }} {{ logical_date | ds_nodash }}"}
