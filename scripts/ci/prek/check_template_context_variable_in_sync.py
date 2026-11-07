@@ -33,6 +33,7 @@ import typing
 from common_prek_utils import AIRFLOW_CORE_ROOT_PATH, AIRFLOW_TASK_SDK_SOURCES_PATH
 
 TASKRUNNER_PY = AIRFLOW_TASK_SDK_SOURCES_PATH / "airflow" / "sdk" / "execution_time" / "task_runner.py"
+EXECUTION_CONTEXT_PY = AIRFLOW_TASK_SDK_SOURCES_PATH / "airflow" / "sdk" / "execution_time" / "context.py"
 CONTEXT_HINT = AIRFLOW_TASK_SDK_SOURCES_PATH / "airflow" / "sdk" / "definitions" / "context.py"
 TEMPLATES_REF_RST = AIRFLOW_CORE_ROOT_PATH / "docs" / "templates-ref.rst"
 
@@ -124,6 +125,33 @@ def _iter_template_context_keys_from_original_return() -> typing.Iterator[str]:
                     and sub_stmt.target.id == "context_from_server"
                 ):
                     yield from extract_keys_from_dict(sub_stmt.value)
+
+    # get_template_context() adds the keys that come from the Dag run with build_dag_run_context().
+    yield from _iter_template_context_keys_from_dag_run_builder()
+
+
+def _iter_template_context_keys_from_dag_run_builder() -> typing.Iterator[str]:
+    context_mod = ast.parse(EXECUTION_CONTEXT_PY.read_text("utf-8"), str(EXECUTION_CONTEXT_PY))
+    fn_builder = next(
+        node
+        for node in ast.iter_child_nodes(context_mod)
+        if isinstance(node, ast.FunctionDef) and node.name == "build_dag_run_context"
+    )
+    # The `context: Context = {...}` it starts from; the other keys depend on the logical date or the Dag.
+    context_assignment = next(
+        stmt
+        for stmt in fn_builder.body
+        if isinstance(stmt, ast.AnnAssign)
+        and isinstance(stmt.target, ast.Name)
+        and stmt.target.id == "context"
+        and isinstance(stmt.value, ast.Dict)
+    )
+    if not isinstance(context_assignment.value, ast.Dict):
+        raise ValueError("'context' in build_dag_run_context is not assigned a dictionary literal")
+    for key in context_assignment.value.keys:
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            raise ValueError("Key in dictionary is not a string literal")
+        yield key.value
 
 
 def _iter_template_context_keys_from_type_hints() -> typing.Iterator[str]:

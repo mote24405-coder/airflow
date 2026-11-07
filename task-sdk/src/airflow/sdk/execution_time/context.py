@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     from airflow.sdk.bases.operator import BaseOperator
     from airflow.sdk.definitions.connection import Connection
     from airflow.sdk.definitions.context import Context
+    from airflow.sdk.definitions.dag import DAG
     from airflow.sdk.execution_time.comms import (
         AssetEventDagRunReferenceResult,
         AssetEventResult,
@@ -109,7 +110,7 @@ if TYPE_CHECKING:
         ReceiveMsgType,
     )
     from airflow.sdk.state import BaseStoreBackend
-    from airflow.sdk.types import OutletEventAccessorsProtocol
+    from airflow.sdk.types import DagRunProtocol, OutletEventAccessorsProtocol
 
 
 DEFAULT_FORMAT_PREFIX = "airflow.ctx."
@@ -1753,3 +1754,61 @@ def context_get_outlet_events(context: Context) -> OutletEventAccessorsProtocol:
     except KeyError:
         outlet_events = context["outlet_events"] = OutletEventAccessors()
     return outlet_events
+
+
+def build_dag_run_context(
+    dag_run: DagRunProtocol, dag: DAG | None = None, *, multi_team: bool = False
+) -> Context:
+    """
+    Build the part of a task's template context that comes from its Dag run.
+
+    ``RuntimeTaskInstance.get_template_context`` adds the task keys to it, and deadline callbacks,
+    which have a Dag run but no task, use it as their context. With ``dag``, it also has ``dag``
+    and the Dag's ``params`` with the Dag run's ``conf`` applied.
+    """
+    from airflow.sdk.definitions.param import process_params
+    from airflow.sdk.execution_time.comms import AssetEventDagRunReferenceResult
+    from airflow.sdk.plugins_manager import integrate_macros_plugins
+    from airflow.sdk.timezone import coerce_datetime
+
+    integrate_macros_plugins()
+
+    context: Context = {
+        "dag_run": dag_run,
+        "run_id": dag_run.run_id,
+        "partition_key": dag_run.partition_key,
+        "partition_date": coerce_datetime(dag_run.partition_date),
+        "triggering_asset_events": TriggeringAssetEventsAccessor.build(
+            AssetEventDagRunReferenceResult.from_asset_event_dag_run_reference(event)
+            for event in dag_run.consumed_asset_events
+        ),
+        "macros": MacrosAccessor(team_name=getattr(dag_run, "team_name", None), multi_team=multi_team),
+        "var": {
+            "json": VariableAccessor(deserialize_json=True),
+            "value": VariableAccessor(deserialize_json=False),
+        },
+        "conn": ConnectionAccessor(),
+    }
+
+    if logical_date := coerce_datetime(dag_run.logical_date):
+        ds = logical_date.strftime("%Y-%m-%d")
+        ts = logical_date.isoformat()
+        # logical_date and data_interval either coexist or be None together
+        context.update(
+            {
+                "logical_date": logical_date,
+                "ds": ds,
+                "ds_nodash": ds.replace("-", ""),
+                "ts": ts,
+                "ts_nodash": logical_date.strftime("%Y%m%dT%H%M%S"),
+                "ts_nodash_with_tz": ts.replace("-", "").replace(":", ""),
+                "data_interval_end": coerce_datetime(dag_run.data_interval_end),
+                "data_interval_start": coerce_datetime(dag_run.data_interval_start),
+            }
+        )
+
+    if dag is not None:
+        context["dag"] = dag
+        context["params"] = process_params(dag, None, dag_run.conf, suppress_exception=False)
+
+    return context
