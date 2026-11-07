@@ -280,7 +280,7 @@ class TemplatedAsyncNotifier(BaseNotifier):
         return f"raw={self.raw_message} rendered={self.message}"
 
 
-class TestCallbackTriggerContext:
+class TestCallbackTriggerContextAndRendering:
     STORED = {"dag_id": "stored"}
     RUNTIME = {"dag_id": "my_dag", "logical_date": timezone.datetime(2024, 6, 15)}
 
@@ -289,27 +289,27 @@ class TestCallbackTriggerContext:
         ("callback_kwargs", "runtime_context", "expected_call"),
         [
             pytest.param(
-                {"message": "{{ dag_id }}"},
+                {"message": "{{ dag_id }} {{ logical_date | ds_nodash }}", "nested": ["{{ dag_id }}"]},
                 RUNTIME,
-                {"message": "{{ dag_id }}", "context": RUNTIME},
-                id="passes-runtime-context",
+                {"message": "my_dag 20240615", "nested": ["my_dag"], "context": RUNTIME},
+                id="renders-with-runtime-context",
             ),
             pytest.param(
                 {"message": "{{ dag_id }}", "context": STORED},
                 RUNTIME,
-                {"message": "{{ dag_id }}", "context": RUNTIME},
+                {"message": "my_dag", "context": RUNTIME},
                 id="prefers-runtime-over-stored-context",
             ),
             pytest.param(
                 {"message": "{{ dag_id }}", "context": STORED},
                 None,
                 {"message": "{{ dag_id }}", "context": STORED},
-                id="stored-context",
+                id="stored-context-is-passed-but-not-rendered",
             ),
             pytest.param({"message": "{{ dag_id }}"}, None, {"message": "{{ dag_id }}"}, id="no-context"),
         ],
     )
-    async def test_run_passes_context(self, callback_kwargs, runtime_context, expected_call):
+    async def test_run_renders_kwargs(self, callback_kwargs, runtime_context, expected_call):
         trigger = CallbackTrigger(callback_path=TEST_CALLBACK_PATH, callback_kwargs=dict(callback_kwargs))
         trigger._callback_context = runtime_context
 
@@ -321,6 +321,20 @@ class TestCallbackTriggerContext:
         mock_callback.assert_called_once_with(**expected_call)
         # The trigger may be serialized again, so its kwargs are left as they were.
         assert trigger.callback_kwargs == callback_kwargs
+
+    @pytest.mark.asyncio
+    async def test_notifier_renders_its_own_kwargs_once(self):
+        """A value holding braces, such as one from the run conf, is rendered once, not again."""
+        trigger = CallbackTrigger(
+            callback_path=TEST_CALLBACK_PATH, callback_kwargs={"message": "{{ conf_msg }}"}
+        )
+        trigger._callback_context = {"conf_msg": "{{ dag_id }}", "dag_id": "my_dag"}
+
+        with mock.patch("airflow.triggers.callback.import_string", return_value=TemplatedAsyncNotifier):
+            events = [event async for event in trigger.run()]
+
+        assert events[-1].payload[PAYLOAD_STATUS_KEY] == CallbackState.SUCCESS
+        assert events[-1].payload[PAYLOAD_BODY_KEY] == "raw={{ conf_msg }} rendered={{ dag_id }}"
 
     @pytest.mark.asyncio
     async def test_notifier_renders_with_a_serialized_dag_in_the_context(self):

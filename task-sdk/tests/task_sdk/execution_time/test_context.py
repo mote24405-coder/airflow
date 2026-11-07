@@ -3208,3 +3208,61 @@ class TestBuildDeadlineCallbackContext:
 
         assert context["callback"] == CallbackMeta(source=CallbackSource.DEADLINE)
         assert "deadline" not in context
+
+
+class TestRenderCallbackKwargs:
+    @staticmethod
+    def _context(dag=None):
+        return build_deadline_callback_context(
+            _dag_run(), dag, deadline_id="abc", deadline_time="2024-06-15T13:00:00+00:00"
+        )
+
+    def test_renders_nested_values(self):
+        from airflow.sdk.execution_time.context import render_callback_kwargs
+
+        context = self._context()
+        kwargs = {
+            "text": "{{ run_id }} {{ deadline.deadline_time | ds }}",
+            "nested": {"ds": ["{{ ds }}", ("{{ ds_nodash }}",)], "count": 3},
+            "context": context,
+        }
+
+        rendered = render_callback_kwargs(kwargs, context)
+
+        assert rendered == {
+            "text": "ctx_run 2024-06-15",
+            "nested": {"ds": ["2024-06-15", ("20240615",)], "count": 3},
+            "context": context,
+        }
+
+    def test_uses_the_dag_template_env(self):
+        from airflow.sdk import DAG
+        from airflow.sdk.execution_time.context import render_callback_kwargs
+
+        dag = DAG(
+            "ctx_dag",
+            params={"x": 7},
+            user_defined_macros={"team": "data"},
+            user_defined_filters={"shout": str.upper},
+        )
+
+        rendered = render_callback_kwargs({"text": "{{ team | shout }} {{ params.x }}"}, self._context(dag))
+
+        assert rendered == {"text": "DATA 7"}
+
+    def test_undefined_value_is_passed_unrendered_with_a_warning(self, captured_logs):
+        """The Dag's StrictUndefined applies, and the failing kwarg is passed as is; the others render."""
+        from airflow.sdk import DAG
+        from airflow.sdk.execution_time.context import render_callback_kwargs
+
+        kwargs = {"bad": "{{ no_such_key }}", "good": "{{ ds }}"}
+
+        rendered = render_callback_kwargs(kwargs, self._context(DAG("ctx_dag")))
+
+        assert rendered == {"bad": "{{ no_such_key }}", "good": "2024-06-15"}
+        assert {
+            "event": "Could not render the template in callback kwarg, passing it unrendered",
+            "kwarg": "bad",
+            "error": "UndefinedError: 'no_such_key' is undefined",
+            "level": "warning",
+        }.items() <= captured_logs[0].items()

@@ -387,8 +387,12 @@ need a task instance, such as ``ti``, ``task`` or ``prev_start_date_success``, a
 Deadline Alert as ``deadline`` (``{{ deadline.id }}``, ``{{ deadline.deadline_time | ds }}``, where
 ``deadline_time`` is a datetime) and ``callback``, whose ``source`` is ``CallbackSource.DEADLINE``.
 
-Airflow does not run :ref:`concepts:jinja-templating` on the kwargs of function callbacks. Notifiers render
-their own template fields with this context.
+Airflow renders :ref:`concepts:jinja-templating` in the ``kwargs`` of function callbacks the way it renders
+``op_kwargs`` for a ``PythonOperator``: every value, including the ones nested in lists and dicts, with the
+Dag's template environment, so ``StrictUndefined`` and the Dag's ``user_defined_macros`` and
+``user_defined_filters`` apply. A value that fails to render is passed to the callback as is, and a warning is
+written to the callback log. Notifiers are not rendered beforehand, since they render their own template
+fields with the same context.
 
 Asynchronous callbacks run in the triggerer, which gets the Dag in its serialized form, as it does for tasks
 that start from the triggerer. A serialized Dag does not keep ``user_defined_macros``, ``user_defined_filters``,
@@ -396,7 +400,8 @@ that start from the triggerer. A serialized Dag does not keep ``user_defined_mac
 always use ``StrictUndefined``. Synchronous callbacks parse the Dag file, as tasks do, and have all of them.
 
 Synchronous callbacks can also read XComs from tasks in the same Dag run through ``context["xcom_pull"]``,
-for example ``context["xcom_pull"]("extract")`` or ``context["xcom_pull"]("extract", key="row_count")``.
+for example ``context["xcom_pull"]("extract")``, ``context["xcom_pull"]("extract", key="row_count")``, or
+``{{ xcom_pull("extract") }}`` in a templated kwarg.
 
 Deadline Calculation
 ^^^^^^^^^^^^^^^^^^^^

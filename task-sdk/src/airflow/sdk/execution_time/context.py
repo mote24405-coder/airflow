@@ -1838,3 +1838,41 @@ def build_deadline_callback_context(
             deadline_time = datetime.fromisoformat(deadline_time)
         context["deadline"] = {"id": deadline_id, "deadline_time": coerce_datetime(deadline_time)}
     return context
+
+
+def render_callback_kwargs(kwargs: dict[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Render the kwargs of a function callback the way ``PythonOperator`` renders ``op_kwargs``.
+
+    Every value is rendered, nested ones included, with the template environment of
+    ``context["dag"]``, so ``StrictUndefined`` and the Dag's macros and filters apply. A value that
+    fails to render is passed on unrendered and a warning is logged, so a bad template does not
+    stop the callback. The ``context`` key is left as it is.
+    """
+    from airflow.sdk.definitions._internal.templater import Templater
+
+    class _CallbackKwargsTemplater(Templater):
+        template_fields = ()
+        template_ext = ()
+
+        def __init__(self, render_template_as_native_obj: bool):
+            # Read by Templater._should_render_native(), as on an operator.
+            self.render_template_as_native_obj = render_template_as_native_obj
+
+    dag = context.get("dag")
+    templater = _CallbackKwargsTemplater(bool(getattr(dag, "render_template_as_native_obj", False)))
+    jinja_env = templater.get_template_env(dag=dag)
+
+    rendered = dict(kwargs)
+    for key, value in kwargs.items():
+        if key == "context":
+            continue
+        try:
+            rendered[key] = templater.render_template(value, context, jinja_env)  # type: ignore[arg-type]
+        except Exception as e:
+            log.warning(
+                "Could not render the template in callback kwarg, passing it unrendered",
+                kwarg=key,
+                error=f"{type(e).__name__}: {e}",
+            )
+    return rendered

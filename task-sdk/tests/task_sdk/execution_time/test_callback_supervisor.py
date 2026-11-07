@@ -33,7 +33,7 @@ from unittest.mock import ANY, Mock, patch
 import pytest
 import structlog
 
-from airflow.sdk import DAG, CallbackMeta, CallbackSource, timezone
+from airflow.sdk import DAG, BaseNotifier, CallbackMeta, CallbackSource, timezone
 from airflow.sdk.api.client import CallbackOperations, Client
 from airflow.sdk.api.datamodels._generated import CallbackTerminalState, DagRunState, DagRunType, XComResponse
 from airflow.sdk.execution_time.callback_supervisor import (
@@ -58,6 +58,7 @@ from airflow.sdk.execution_time.comms import (
     XComResult,
     _RequestFrame,
 )
+from airflow.sdk.execution_time.context import build_deadline_callback_context
 
 from tests_common.test_utils.config import conf_vars
 
@@ -663,6 +664,7 @@ class TestCallbackSubprocessStart:
             dag_rel_path=base_start_kwargs["dag_rel_path"],
             log=ANY,
             callback_kwargs_encoding=callback_kwargs_encoding,
+            render_kwargs=False,
         )
 
     def test_execute_callback_with_bundle_info_should_pass_correct_parameters(
@@ -693,6 +695,7 @@ class TestCallbackSubprocessStart:
             dag_rel_path=adjusted_kwargs["dag_rel_path"],
             log=ANY,
             callback_kwargs_encoding=None,
+            render_kwargs=False,
         )
 
     def test_callback_supervisor_with_bundle_info_should_adjust_sys_path(
@@ -963,6 +966,8 @@ class TestCallbackContextFetch:
         self.mock_comms_instance.send.assert_called_once_with(GetDagRun(dag_id="ctx_dag", run_id="ctx_run"))
         self.mock_parse.assert_called_once_with("ctx_dag", Path("dags/my_dag.py"), None, None, ANY)
         call = self.mock_execute_callback.call_args.kwargs
+        # Rendered in execute_callback, after the kwargs are decoded.
+        assert call["render_kwargs"] is True
         assert call["callback_kwargs"]["message"] == "{{ dag_run.dag_id }} {{ logical_date | ds_nodash }}"
         context = call["callback_kwargs"]["context"]
         assert context["dag"] is self.dag
@@ -993,6 +998,7 @@ class TestCallbackContextFetch:
         self.mock_parse.assert_not_called()
         call = self.mock_execute_callback.call_args.kwargs
         assert call["callback_kwargs"] == {"message": "{{ dag_run.dag_id }} {{ logical_date | ds_nodash }}"}
+        assert call["render_kwargs"] is False
 
 
 class TestParseCallbackDag:
@@ -1018,3 +1024,82 @@ class TestParseCallbackDag:
 
         assert _parse_callback_dag("my_dag", Path("other.py"), str(tmp_path), None, log) is None
         log.warning.assert_called_once()
+
+
+ctx_received: dict[str, Any] = {}
+
+
+def ctx_recording_callback(**kwargs):
+    ctx_received.clear()
+    ctx_received.update(kwargs)
+
+
+class RecordingNotifier(BaseNotifier):
+    template_fields = ("text",)
+    seen: list[str] = []
+
+    def __init__(self, text):
+        super().__init__()
+        RecordingNotifier.seen.append(text)
+        self.text = text
+
+    def notify(self, context):
+        RecordingNotifier.seen.append(self.text)
+
+
+class TestExecuteCallbackRendering:
+    @staticmethod
+    def _context(conf=None, dag=None):
+        return build_deadline_callback_context(
+            DAG_RUN.model_copy(update={"conf": conf}),
+            dag,
+            deadline_id="abc",
+            deadline_time="2024-06-15T13:00:00+00:00",
+        )
+
+    def _execute(self, path, kwargs, encoding=None):
+        return execute_callback(
+            callback_path=path,
+            callback_kwargs=kwargs,
+            dag_rel_path=Path("test.py"),
+            bundle_path=None,
+            log=Mock(),
+            callback_kwargs_encoding=encoding,
+            render_kwargs=True,
+        )
+
+    def test_function_kwargs_are_rendered_after_decoding(self):
+        from airflow.sdk.serde import serialize
+
+        context = self._context()
+        kwargs = {
+            "text": serialize("{{ run_id }} {{ deadline.deadline_time | ds }}"),
+            "nested": serialize({"days": ["{{ ds }}"]}),
+            "context": context,
+        }
+
+        assert self._execute(f"{__name__}.ctx_recording_callback", kwargs, encoding="serde") == (True, None)
+
+        assert ctx_received["text"] == "ctx_run 2024-06-15"
+        assert ctx_received["nested"] == {"days": ["2024-06-15"]}
+        assert ctx_received["context"] is context
+
+    def test_xcom_pull_can_be_used_in_templates(self):
+        context = {**self._context(), "xcom_pull": lambda task_id: f"value-of-{task_id}"}
+
+        self._execute(
+            f"{__name__}.ctx_recording_callback", {"text": "{{ xcom_pull('extract') }}", "context": context}
+        )
+
+        assert ctx_received["text"] == "value-of-extract"
+
+    def test_notifier_kwargs_are_rendered_once_by_the_notifier(self):
+        """A conf value that holds braces is rendered once, by the notifier, and not a second time."""
+        RecordingNotifier.seen = []
+        context = self._context(conf={"msg": "{{ ds }}"}, dag=DAG("ctx_dag"))
+
+        self._execute(
+            f"{__name__}.RecordingNotifier", {"text": "{{ dag_run.conf['msg'] }}", "context": context}
+        )
+
+        assert RecordingNotifier.seen == ["{{ dag_run.conf['msg'] }}", "{{ ds }}"]

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import signal
 import sys
@@ -157,6 +158,7 @@ def execute_callback(
     bundle_path: os.PathLike[str] | None,
     log,
     callback_kwargs_encoding: str | None = None,
+    render_kwargs: bool = False,
 ) -> tuple[bool, str | None]:
     """
     Execute a callback function by importing and calling it, returning the success state.
@@ -178,6 +180,9 @@ def execute_callback(
     :param bundle_path: Path to the bundle file.
     :param log: Logger instance for recording execution.
     :param callback_kwargs_encoding: How ``callback_kwargs`` is encoded, see :func:`decode_callback_kwargs`.
+    :param render_kwargs: Render the kwargs of a function callback with ``callback_kwargs["context"]``,
+        see :func:`~airflow.sdk.execution_time.context.render_callback_kwargs`. Classes such as
+        notifiers render their own template fields, so their kwargs are passed as they are.
     :return: Tuple of (success: bool, error_message: str | None)
     """
     if not callback_path:
@@ -209,6 +214,10 @@ def execute_callback(
             module = import_module(module_path)
         callback_callable = getattr(module, function_name)
         callback_kwargs = decode_callback_kwargs(callback_kwargs, callback_kwargs_encoding)
+        if render_kwargs and not inspect.isclass(callback_callable):
+            from airflow.sdk.execution_time.context import render_callback_kwargs
+
+            callback_kwargs = render_callback_kwargs(callback_kwargs, callback_kwargs["context"])
 
         log.debug("Executing callback", callback_path=callback_path, callback_kwargs=callback_kwargs)
 
@@ -381,6 +390,7 @@ class CallbackSubprocess(WatchedSubprocess):
                 )
                 kwargs = {**callback_kwargs, "context": context}
 
+            # Before rendering, so templates can use it too.
             _add_xcom_pull_to_context(kwargs)
             success, error_msg = execute_callback(
                 callback_path=callback_path,
@@ -389,6 +399,7 @@ class CallbackSubprocess(WatchedSubprocess):
                 bundle_path=bundle_path,
                 log=_log,
                 callback_kwargs_encoding=callback_kwargs_encoding,
+                render_kwargs=bool(dag_id and run_id),
             )
             if not success:
                 _log.error("Callback failed", error=error_msg)

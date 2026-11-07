@@ -25,6 +25,7 @@ from typing import Any
 
 from airflow._shared.module_loading import accepts_context, import_string, qualname
 from airflow.models.callback import CallbackState
+from airflow.sdk.execution_time.context import render_callback_kwargs  # noqa: SDK001
 from airflow.triggers.base import BaseTrigger, TriggerEvent
 
 log = logging.getLogger(__name__)
@@ -95,6 +96,9 @@ class CallbackTrigger(BaseTrigger):
             # pass it twice, and prefer the context the TriggerRunner built at runtime.
             stored_context = kwargs.pop("context", None)
             context = self._callback_context or stored_context
+            # Notifiers render their own template fields, so only function callbacks are rendered here.
+            if self._callback_context is not None and not inspect.isclass(callback):
+                kwargs = render_callback_kwargs(kwargs, self._callback_context)
 
             if accepts_context(callback) and context is not None:
                 result = await callback(**kwargs, context=context)
