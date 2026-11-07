@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from structlog.typing import FilteringBoundLogger
 
     from airflow.sdk.api.client import Client
+    from airflow.sdk.definitions.dag import DAG
 
     # Core (airflow.executors.workloads.base.BundleInfo) and SDK (airflow.sdk.api.datamodels._generated.BundleInfo)
     # are structurally identical, but MyPy treats them as different types. This Protocol makes MyPy happy.
@@ -188,7 +189,10 @@ def execute_callback(
         module_path, function_name = callback_path.rsplit(".", 1)
         # If the callback is defined within the Dag module, the module path is modified during DAG serialization.
         # Attempt to import it using the path of the Dag file.
-        if module_path.startswith(UNUSUAL_MODULE_PREFIX):
+        if module_path.startswith(UNUSUAL_MODULE_PREFIX) and module_path in sys.modules:
+            # Already imported when the Dag file was parsed for the context; don't run it twice.
+            module = sys.modules[module_path]
+        elif module_path.startswith(UNUSUAL_MODULE_PREFIX):
             if not dag_rel_path:
                 return False, "Dag relative path not found."
             if not bundle_path:
@@ -241,6 +245,42 @@ def execute_callback(
             error_msg=error_msg,
         )
         return False, error_msg
+
+
+def _parse_callback_dag(
+    dag_id: str,
+    dag_rel_path: os.PathLike[str] | None,
+    bundle_path: str | None,
+    bundle_info: _BundleInfoLike | None,
+    log,
+) -> DAG | None:
+    """
+    Parse the Dag of a callback from its file, the way ``task_runner.parse`` does for a task.
+
+    The callback still runs without it, but then its context has no ``dag`` or ``params`` and its
+    kwargs are rendered with the default template environment.
+    """
+    from airflow.dag_processing.dagbag import BundleDagBag
+    from airflow.sdk.definitions.dag import DAG as SdkDag
+
+    if not bundle_path or not dag_rel_path:
+        log.warning("No Dag bundle for the callback, so its context has no Dag", dag_id=dag_id)
+        return None
+    try:
+        bag = BundleDagBag(
+            dag_folder=os.fspath(Path(bundle_path, dag_rel_path)),
+            safe_mode=False,
+            load_op_links=False,
+            bundle_path=Path(bundle_path),
+            bundle_name=bundle_info.name if bundle_info else None,
+        )
+    except Exception:
+        log.warning("Could not parse the Dag file of the callback", dag_id=dag_id, exc_info=True)
+        return None
+    if not isinstance(dag := bag.dags.get(dag_id), SdkDag):
+        log.warning("Dag not found in its file, so the callback context has no Dag", dag_id=dag_id)
+        return None
+    return dag
 
 
 @attrs.define(kw_only=True)
@@ -334,6 +374,7 @@ class CallbackSubprocess(WatchedSubprocess):
                     sys.exit(1)
                 context = build_deadline_callback_context(
                     dag_run,
+                    _parse_callback_dag(dag_id, dag_rel_path, bundle_path, bundle_info, _log),
                     deadline_id=deadline_id,
                     deadline_time=deadline_time,
                     multi_team=conf.getboolean("core", "multi_team", fallback=False),

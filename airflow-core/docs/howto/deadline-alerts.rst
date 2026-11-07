@@ -382,13 +382,18 @@ Templating and Context
 
 The context is built when the callback runs, from the Dag run as it is at that point. It is a task's context
 without the task fields: ``dag_run``, ``run_id``, ``logical_date``, ``ds``, ``ts``, ``data_interval_start``,
-``macros``, ``var``, ``conn`` and the rest of what a task gets from its Dag run. Fields that
+``params``, ``macros``, ``var``, ``conn`` and the rest of what a task gets from its Dag run and Dag. Fields that
 need a task instance, such as ``ti``, ``task`` or ``prev_start_date_success``, are not there. It also has the
 Deadline Alert as ``deadline`` (``{{ deadline.id }}``, ``{{ deadline.deadline_time | ds }}``, where
 ``deadline_time`` is a datetime) and ``callback``, whose ``source`` is ``CallbackSource.DEADLINE``.
 
 Airflow does not run :ref:`concepts:jinja-templating` on the kwargs of function callbacks. Notifiers render
 their own template fields with this context.
+
+Asynchronous callbacks run in the triggerer, which gets the Dag in its serialized form, as it does for tasks
+that start from the triggerer. A serialized Dag does not keep ``user_defined_macros``, ``user_defined_filters``,
+``template_undefined`` or ``jinja_environment_kwargs``, so asynchronous callback templates can't use them and
+always use ``StrictUndefined``. Synchronous callbacks parse the Dag file, as tasks do, and have all of them.
 
 Synchronous callbacks can also read XComs from tasks in the same Dag run through ``context["xcom_pull"]``,
 for example ``context["xcom_pull"]("extract")`` or ``context["xcom_pull"]("extract", key="row_count")``.

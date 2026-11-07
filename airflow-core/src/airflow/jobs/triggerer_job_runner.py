@@ -1051,17 +1051,21 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
             if trigger.assets:
                 watched_assets = {a.name: a.uri for a in trigger.assets}
 
-            dag_run_data = None
+            dag_run_data = dag_data = None
             if callback := getattr(trigger, "callback", None):
                 callback_data = callback.data or {}
                 dag_run = self._fetch_callback_dag_run(callback_data, session=session)
                 if dag_run is not None:
-                    # Send the Dag run, as for start_from_trigger tasks below.
+                    # Send the Dag run and the serialized Dag, as for start_from_trigger tasks below.
                     dag_run_data = dag_run.dag_run_data.model_dump(exclude_unset=True)
                     dag_run_data["_deadline"] = {
                         "id": callback_data.get("deadline_id"),
                         "deadline_time": callback_data.get("deadline_time"),
                     }
+                    if serialized_dag_model := dag_bag.get_serialized_dag_model_for_run(
+                        dag_run, session=session
+                    ):
+                        dag_data = serialized_dag_model.data
                 elif callback_data.get("run_id"):
                     from airflow.models.callback import CallbackState
                     from airflow.triggers.callback import PAYLOAD_BODY_KEY, PAYLOAD_STATUS_KEY
@@ -1093,6 +1097,7 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
                 classpath=trigger.classpath,
                 encrypted_kwargs=trigger.encrypted_kwargs,
                 watched_assets=watched_assets,
+                dag_data=dag_data,
                 dag_run_data=dag_run_data,
             )
 
@@ -1669,14 +1674,15 @@ class TriggerRunner:
         )
 
     @staticmethod
-    def _build_callback_context(dag_run_data: dict) -> dict[str, Any]:
-        """Build the context of a callback trigger from the Dag run on its workload."""
+    def _build_callback_context(dag_run_data: dict, encoded_dag: dict | None) -> dict[str, Any]:
+        """Build the context of a callback trigger from the Dag run and serialized Dag on its workload."""
         from airflow.api_fastapi.execution_api.datamodels.taskinstance import DagRun as DRDataModel
 
         dag_run_data = dict(dag_run_data)
         deadline = dag_run_data.pop("_deadline", None) or {}
         return build_deadline_callback_context(
             DRDataModel(**dag_run_data),  # type: ignore[arg-type]
+            DagSerialization.from_dict(encoded_dag) if encoded_dag else None,  # type: ignore[arg-type]
             deadline_id=deadline.get("id"),
             deadline_time=deadline.get("deadline_time"),
             multi_team=conf.getboolean("core", "multi_team"),
@@ -1739,7 +1745,7 @@ class TriggerRunner:
                         # Same as setting task_instance on task-bound triggers above.
                         if isinstance(trigger_instance, CallbackTrigger):
                             trigger_instance._callback_context = self._build_callback_context(
-                                workload.dag_run_data
+                                workload.dag_run_data, workload.dag_data
                             )
             except Exception as err:
                 # Kwargs are decoded here rather than when queued, so one trigger with undecodable

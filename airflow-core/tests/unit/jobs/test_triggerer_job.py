@@ -117,7 +117,7 @@ from airflow.sdk.execution_time.comms import (
     _ResponseFrame,
 )
 from airflow.sdk.execution_time.context import AssetStateStoreAccessors
-from airflow.serialization.serialized_objects import LazyDeserializedDAG
+from airflow.serialization.serialized_objects import DagSerialization, LazyDeserializedDAG
 from airflow.triggers.base import (
     AssetTriggerEvent,
     BaseEventTrigger,
@@ -1115,7 +1115,7 @@ class TestCreateWorkloadCallbackContext:
         session.flush()
         return dr
 
-    def test_workload_includes_dag_run_for_callback_trigger(
+    def test_workload_includes_dag_run_and_serialized_dag_for_callback_trigger(
         self, jobless_supervisor, callback_trigger, session, dag_maker
     ):
         dr = self._make_dagrun(session, dag_maker)
@@ -1134,6 +1134,9 @@ class TestCreateWorkloadCallbackContext:
         )
 
         assert workload is not None
+        # The serialized Dag of the run, as start_from_trigger tasks get it.
+        assert workload.dag_data is not None
+        assert DagSerialization.from_dict(workload.dag_data).dag_id == dr.dag_id
         assert workload.dag_run_data is not None
         assert workload.dag_run_data["dag_id"] == dr.dag_id
         assert workload.dag_run_data["run_id"] == dr.run_id
@@ -1194,8 +1197,9 @@ class TestCreateWorkloadCallbackContext:
 @pytest.mark.asyncio
 @patch("airflow.jobs.triggerer_job_runner.TriggerRunner.get_trigger_by_classpath")
 async def test_create_triggers_sets_callback_context_from_dag_run_data(mock_get_classpath, session):
-    """dag_run_data on the workload becomes _callback_context on CallbackTrigger instances."""
-    from airflow.sdk import CallbackMeta, CallbackSource
+    """dag_run_data and dag_data on the workload become _callback_context on CallbackTrigger instances."""
+    from airflow.sdk import DAG, CallbackMeta, CallbackSource
+    from airflow.serialization.definitions.dag import SerializedDAG
     from airflow.triggers.callback import CallbackTrigger
 
     injected_instances: list[CallbackTrigger] = []
@@ -1226,6 +1230,7 @@ async def test_create_triggers_sets_callback_context_from_dag_run_data(mock_get_
         "partition_key": None,
         "_deadline": {"id": "abc", "deadline_time": "2024-06-15T13:00:00+00:00"},
     }
+    dag_data = LazyDeserializedDAG.from_dag(DAG("ctx_dag", params={"x": 1, "y": "a"})).data
 
     runner = TriggerRunner()
     runner.to_create.append(
@@ -1235,6 +1240,7 @@ async def test_create_triggers_sets_callback_context_from_dag_run_data(mock_get_
             classpath="fake.CallbackTrigger",
             encrypted_kwargs=Trigger.encrypt_kwargs({"callback_path": "x.y", "callback_kwargs": {}}),
             dag_run_data=dag_run_data,
+            dag_data=dag_data,
         )
     )
 
@@ -1249,6 +1255,8 @@ async def test_create_triggers_sets_callback_context_from_dag_run_data(mock_get_
     assert context["deadline"] == {"id": "abc", "deadline_time": timezone.datetime(2024, 6, 15, 13)}
     assert type(context["deadline"]["deadline_time"]) is type(context["logical_date"])
     assert context["callback"] == CallbackMeta(source=CallbackSource.DEADLINE)
+    assert isinstance(context["dag"], SerializedDAG)
+    assert context["params"] == {"x": 2, "y": "a"}
 
     runner.triggers[20]["task"].cancel()
     await runner.cleanup_finished_triggers()

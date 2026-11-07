@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import signal
 import socket
+import sys
+import types
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
@@ -31,12 +33,13 @@ from unittest.mock import ANY, Mock, patch
 import pytest
 import structlog
 
-from airflow.sdk import CallbackMeta, CallbackSource, timezone
+from airflow.sdk import DAG, CallbackMeta, CallbackSource, timezone
 from airflow.sdk.api.client import CallbackOperations, Client
 from airflow.sdk.api.datamodels._generated import CallbackTerminalState, DagRunState, DagRunType, XComResponse
 from airflow.sdk.execution_time.callback_supervisor import (
     CallbackSubprocess,
     Path,
+    _parse_callback_dag,
     execute_callback,
     supervise_callback,
 )
@@ -263,6 +266,20 @@ class TestExecuteCallback:
 
         assert success is False
         assert "Unsupported callback kwargs encoding" in error
+
+    def test_execute_callback_reuses_the_dag_module_parsed_for_the_context(self, monkeypatch):
+        """A callback defined in the Dag file is not run from the file again once the Dag was parsed."""
+        module_name = "unusual_prefix_0123abcd_my_dag"
+        module = types.ModuleType(module_name)
+        module.my_callback = callback_recording_kwargs
+        monkeypatch.setitem(sys.modules, module_name, module)
+
+        success, error = execute_callback(
+            f"{module_name}.my_callback", {"arg": 1}, Path("missing.py"), Path("/no/such/bundle"), Mock()
+        )
+
+        assert (success, error) == (True, None)
+        assert received_kwargs == {"arg": 1}
 
 
 class TestCallbackHandleRequest:
@@ -903,7 +920,7 @@ class TestSuperviseCallbackReportsTerminalState:
 
 
 class TestCallbackContextFetch:
-    """The subprocess target builds the context from the Dag run."""
+    """The subprocess target builds the context from the Dag run and its parsed Dag."""
 
     @pytest.fixture(autouse=True)
     def base_mocks_setup(self):
@@ -911,12 +928,16 @@ class TestCallbackContextFetch:
             patch("airflow.sdk.execution_time.comms.CommsDecoder") as mock_comms,
             patch("airflow.sdk.execution_time.callback_supervisor.WatchedSubprocess.start") as mock_super,
             patch("airflow.sdk.execution_time.callback_supervisor.execute_callback") as mock_execute,
+            patch("airflow.sdk.execution_time.callback_supervisor._parse_callback_dag") as mock_parse,
         ):
             mock_execute.return_value = (True, None)
             # The target replaces SUPERVISOR_COMMS with a new CommsDecoder[...](...) instance.
             self.mock_comms_instance = mock_comms.__getitem__.return_value.return_value
             self.mock_super_start = mock_super
             self.mock_execute_callback = mock_execute
+            self.dag = DAG("ctx_dag", params={"x": 1})
+            mock_parse.return_value = self.dag
+            self.mock_parse = mock_parse
             yield
 
     def _start_and_run_target(self, **overrides):
@@ -932,7 +953,7 @@ class TestCallbackContextFetch:
         )
         self.mock_super_start.call_args.kwargs["target"]()
 
-    def test_builds_context_from_the_dag_run(self):
+    def test_builds_context_from_the_dag_run_and_the_parsed_dag(self):
         self.mock_comms_instance.send.return_value = DAG_RUN
 
         self._start_and_run_target(
@@ -940,9 +961,12 @@ class TestCallbackContextFetch:
         )
 
         self.mock_comms_instance.send.assert_called_once_with(GetDagRun(dag_id="ctx_dag", run_id="ctx_run"))
+        self.mock_parse.assert_called_once_with("ctx_dag", Path("dags/my_dag.py"), None, None, ANY)
         call = self.mock_execute_callback.call_args.kwargs
         assert call["callback_kwargs"]["message"] == "{{ dag_run.dag_id }} {{ logical_date | ds_nodash }}"
         context = call["callback_kwargs"]["context"]
+        assert context["dag"] is self.dag
+        assert context["params"] == {"x": 1}
         assert context["ds"] == "2024-06-15"
         assert context["callback"] == CallbackMeta(source=CallbackSource.DEADLINE)
         assert context["deadline"] == {"id": "abc", "deadline_time": timezone.datetime(2024, 6, 15, 13)}
@@ -966,5 +990,31 @@ class TestCallbackContextFetch:
         self._start_and_run_target()
 
         self.mock_comms_instance.send.assert_not_called()
+        self.mock_parse.assert_not_called()
         call = self.mock_execute_callback.call_args.kwargs
         assert call["callback_kwargs"] == {"message": "{{ dag_run.dag_id }} {{ logical_date | ds_nodash }}"}
+
+
+class TestParseCallbackDag:
+    def test_parses_the_dag_file_in_the_bundle(self, tmp_path):
+        (tmp_path / "dags").mkdir()
+        (tmp_path / "dags" / "my_dag.py").write_text(
+            "from airflow.sdk import DAG\n"
+            "with DAG('my_dag', params={'x': 1}, user_defined_macros={'team': 'data'}):\n"
+            "    pass\n"
+        )
+
+        dag = _parse_callback_dag(
+            "my_dag", Path("dags/my_dag.py"), str(tmp_path), BundleInfo(name="b", version=None), Mock()
+        )
+
+        assert dag is not None
+        assert dag.dag_id == "my_dag"
+        assert dag.user_defined_macros == {"team": "data"}
+
+    def test_missing_dag_returns_none(self, tmp_path):
+        (tmp_path / "other.py").write_text("x = 1\n")
+        log = Mock()
+
+        assert _parse_callback_dag("my_dag", Path("other.py"), str(tmp_path), None, log) is None
+        log.warning.assert_called_once()
