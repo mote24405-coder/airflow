@@ -64,6 +64,7 @@ from airflow.models.task_coordinates import TaskCoordinateResolver
 from airflow.models.trigger import RecordedFailure, Trigger, TriggerKind
 from airflow.observability.metrics import stats_utils
 from airflow.sdk._shared.secrets_masker import redact  # noqa: SDK001
+from airflow.sdk.api.datamodels._generated import PrevSuccessfulDagRunResponse
 from airflow.sdk.bases.xcom import _current_trigger_ti
 from airflow.sdk.definitions.asset import Asset
 from airflow.sdk.execution_time import supervisor
@@ -144,6 +145,7 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.log.task_log_address import prepare_task_log_contexts, render_task_log_filename
 from airflow.utils.retries import run_with_db_retries
 from airflow.utils.session import create_session, provide_session
+from airflow.utils.state import DagRunState
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -1052,10 +1054,21 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
                 watched_assets = {a.name: a.uri for a in trigger.assets}
 
             dag_run_data = dag_data = None
+            previous_successful_dag_run = None
             if callback := getattr(trigger, "callback", None):
                 callback_data = callback.data or {}
                 dag_run = self._fetch_callback_dag_run(callback_data, session=session)
                 if dag_run is not None:
+                    from airflow.models.dagrun import DagRun
+
+                    previous_run = DagRun.get_previous_dagrun(
+                        dag_run, state=DagRunState.SUCCESS, session=session
+                    )
+                    if previous_run is not None:
+                        previous_successful_dag_run = PrevSuccessfulDagRunResponse.model_validate(
+                            previous_run, from_attributes=True
+                        )
+
                     # Send the Dag run and the serialized Dag, as for start_from_trigger tasks below.
                     dag_run_data = dag_run.dag_run_data.model_dump(exclude_unset=True)
                     dag_run_data["_deadline"] = {
@@ -1099,6 +1112,7 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
                 watched_assets=watched_assets,
                 dag_data=dag_data,
                 dag_run_data=dag_run_data,
+                previous_successful_dag_run=previous_successful_dag_run,
             )
 
         if not trigger.task_instance.dag_version_id:
@@ -1674,7 +1688,12 @@ class TriggerRunner:
         )
 
     @staticmethod
-    def _build_callback_context(dag_run_data: dict, encoded_dag: dict | None) -> Context:
+    def _build_callback_context(
+        dag_run_data: dict,
+        encoded_dag: dict | None,
+        *,
+        previous_successful_dag_run: PrevSuccessfulDagRunResponse | None = None,
+    ) -> Context:
         """Build the context of a callback trigger from the Dag run and serialized Dag on its workload."""
         from airflow.api_fastapi.execution_api.datamodels.taskinstance import DagRun as DRDataModel
 
@@ -1686,6 +1705,7 @@ class TriggerRunner:
             deadline_id=deadline.get("id"),
             deadline_time=deadline.get("deadline_time"),
             multi_team=conf.getboolean("core", "multi_team"),
+            previous_successful_dag_run=previous_successful_dag_run,
         )
 
     async def create_triggers(self):
@@ -1745,7 +1765,9 @@ class TriggerRunner:
                         # Same as setting task_instance on task-bound triggers above.
                         if isinstance(trigger_instance, CallbackTrigger):
                             trigger_instance._callback_context = self._build_callback_context(
-                                workload.dag_run_data, workload.dag_data
+                                workload.dag_run_data,
+                                workload.dag_data,
+                                previous_successful_dag_run=workload.previous_successful_dag_run,
                             )
             except Exception as err:
                 # Kwargs are decoded here rather than when queued, so one trigger with undecodable

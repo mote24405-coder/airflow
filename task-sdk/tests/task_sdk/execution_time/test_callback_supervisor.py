@@ -49,10 +49,12 @@ from airflow.sdk.execution_time.comms import (
     DagRunResult,
     GetConnection,
     GetDagRun,
+    GetPreviousDagRun,
     GetVariable,
     GetVariableKeys,
     GetXCom,
     MaskSecret,
+    PreviousDagRunResult,
     VariableKeysResult,
     VariableResult,
     XComResult,
@@ -404,6 +406,23 @@ class TestCallbackHandleRequest:
                 method_path="dag_runs.get_detail",
                 args=("ctx_dag", "ctx_run"),
                 response=DAG_RUN,
+            ),
+        ),
+        RequestCase(
+            message=GetPreviousDagRun(
+                dag_id="ctx_dag",
+                logical_date=timezone.datetime(2024, 6, 15, 12, 30),
+                state="success",
+            ),
+            test_id="get_previous_successful_dag_run",
+            client_mock=ClientMock(
+                method_path="dag_runs.get_previous",
+                kwargs={
+                    "dag_id": "ctx_dag",
+                    "logical_date": timezone.datetime(2024, 6, 15, 12, 30),
+                    "state": "success",
+                },
+                response=PreviousDagRunResult(),
             ),
         ),
     ]
@@ -957,13 +976,34 @@ class TestCallbackContextFetch:
         self.mock_super_start.call_args.kwargs["target"]()
 
     def test_builds_context_from_the_dag_run_and_the_parsed_dag(self):
-        self.mock_comms_instance.send.return_value = DAG_RUN
+        previous_run = DAG_RUN.model_copy(
+            update={
+                "run_id": "previous_success",
+                "logical_date": timezone.datetime(2024, 6, 13),
+                "data_interval_start": timezone.datetime(2024, 6, 13),
+                "data_interval_end": timezone.datetime(2024, 6, 14),
+                "start_date": timezone.datetime(2024, 6, 14, 1),
+                "end_date": timezone.datetime(2024, 6, 14, 2),
+                "state": DagRunState.SUCCESS,
+            }
+        )
+        self.mock_comms_instance.send.side_effect = [
+            DAG_RUN,
+            PreviousDagRunResult(dag_run=previous_run),
+        ]
 
         self._start_and_run_target(
             dag_id="ctx_dag", run_id="ctx_run", deadline_id="abc", deadline_time="2024-06-15T13:00:00+00:00"
         )
 
-        self.mock_comms_instance.send.assert_called_once_with(GetDagRun(dag_id="ctx_dag", run_id="ctx_run"))
+        calls = self.mock_comms_instance.send.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args[0] == GetDagRun(dag_id="ctx_dag", run_id="ctx_run")
+        assert calls[1].args[0] == GetPreviousDagRun(
+            dag_id="ctx_dag",
+            logical_date=timezone.datetime(2024, 6, 15, 12, 30),
+            state="success",
+        )
         self.mock_parse.assert_called_once_with("ctx_dag", Path("dags/my_dag.py"), None, None, ANY)
         call = self.mock_execute_callback.call_args.kwargs
         # Rendered in execute_callback, after the kwargs are decoded.
@@ -976,6 +1016,8 @@ class TestCallbackContextFetch:
         assert context["callback"] == CallbackMeta(source=CallbackSource.DEADLINE)
         assert context["deadline"] == {"id": "abc", "deadline_time": timezone.datetime(2024, 6, 15, 13)}
         assert callable(context["xcom_pull"])
+        assert context["prev_data_interval_start_success"] == timezone.datetime(2024, 6, 13)
+        assert context["prev_end_date_success"] == timezone.datetime(2024, 6, 14, 2)
 
     @pytest.mark.parametrize(
         "send",

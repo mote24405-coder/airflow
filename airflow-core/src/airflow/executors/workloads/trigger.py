@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 # Using noqa because Ruff wants this in a TYPE_CHECKING block but Pydantic fails if it is.
 from airflow.executors.workloads.task import TaskInstanceDTO  # noqa: TCH001
+from airflow.sdk.api.datamodels._generated import PrevSuccessfulDagRunResponse  # noqa: TC001
 
 
 class RunTrigger(BaseModel):
@@ -46,6 +47,7 @@ class RunTrigger(BaseModel):
     dag_run_data: dict | None = (
         None  # Serialized DagRun data in dict format so it can be deserialized in trigger subprocess.
     )
+    previous_successful_dag_run: PrevSuccessfulDagRunResponse | None = None
 
     # name: uri of all "watched" Assets
     watched_assets: dict[str, str] | None = None  # Set for BaseEventTrigger asset watchers only

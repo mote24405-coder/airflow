@@ -3219,6 +3219,28 @@ class TestBuildDeadlineCallbackContext:
 
         assert set(context) <= KNOWN_CONTEXT_KEYS
 
+    def test_includes_previous_successful_dag_run_dates(self):
+        from airflow.sdk.api.datamodels._generated import PrevSuccessfulDagRunResponse
+
+        previous_run = PrevSuccessfulDagRunResponse(
+            data_interval_start=timezone.datetime(2024, 6, 13),
+            data_interval_end=timezone.datetime(2024, 6, 14),
+            start_date=timezone.datetime(2024, 6, 14, 1),
+            end_date=timezone.datetime(2024, 6, 14, 2),
+        )
+
+        context = build_deadline_callback_context(
+            _dag_run(),
+            deadline_id=None,
+            deadline_time=None,
+            previous_successful_dag_run=previous_run,
+        )
+
+        assert context["prev_data_interval_start_success"] == timezone.datetime(2024, 6, 13)
+        assert context["prev_data_interval_end_success"] == timezone.datetime(2024, 6, 14)
+        assert context["prev_start_date_success"] == timezone.datetime(2024, 6, 14, 1)
+        assert context["prev_end_date_success"] == timezone.datetime(2024, 6, 14, 2)
+
 
 class TestRenderCallbackKwargs:
     @staticmethod

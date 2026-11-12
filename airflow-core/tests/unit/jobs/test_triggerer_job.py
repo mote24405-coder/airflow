@@ -91,7 +91,7 @@ from airflow.providers.standard.triggers.file import FileDeleteTrigger
 from airflow.providers.standard.triggers.temporal import DateTimeTrigger, TimeDeltaTrigger
 from airflow.sdk import DAG, Asset, BaseHook, BaseOperator, task_group
 from airflow.sdk.api.client import Client
-from airflow.sdk.api.datamodels._generated import AssetStateStoreResponse
+from airflow.sdk.api.datamodels._generated import AssetStateStoreResponse, PrevSuccessfulDagRunResponse
 from airflow.sdk.bases.xcom import _current_trigger_ti
 from airflow.sdk.definitions._internal.loop import create_loop
 from airflow.sdk.exceptions import ErrorType
@@ -129,7 +129,7 @@ from airflow.triggers.base import (
 )
 from airflow.triggers.shared_stream import SharedStreamProducer
 from airflow.triggers.testing import FailureTrigger, SuccessTrigger
-from airflow.utils.state import State, TaskInstanceState
+from airflow.utils.state import DagRunState, State, TaskInstanceState
 from airflow.utils.types import DagRunType
 
 from tests_common.test_utils.config import conf_vars
@@ -1115,10 +1115,24 @@ class TestCreateWorkloadCallbackContext:
         session.flush()
         return dr
 
+    @pytest.mark.parametrize("has_previous_success", [False, True], ids=["no-success", "has-success"])
     def test_workload_includes_dag_run_and_serialized_dag_for_callback_trigger(
-        self, jobless_supervisor, callback_trigger, session, dag_maker
+        self, jobless_supervisor, callback_trigger, session, dag_maker, has_previous_success
     ):
         dr = self._make_dagrun(session, dag_maker)
+        assert dr.logical_date is not None
+        earlier_run = dag_maker.create_dagrun(
+            run_id="earlier_run",
+            logical_date=dr.logical_date - datetime.timedelta(days=2),
+            state=DagRunState.SUCCESS if has_previous_success else DagRunState.FAILED,
+        )
+        dag_maker.create_dagrun(
+            run_id="more_recent_failed_run",
+            logical_date=dr.logical_date - datetime.timedelta(days=1),
+            state=DagRunState.FAILED,
+        )
+        session.flush()
+
         callback_trigger.callback.data = {
             "dag_id": dr.dag_id,
             "run_id": dr.run_id,
@@ -1144,6 +1158,15 @@ class TestCreateWorkloadCallbackContext:
             "id": "abc-123",
             "deadline_time": "2024-01-01T01:00:00+00:00",
         }
+        if has_previous_success:
+            assert workload.previous_successful_dag_run == PrevSuccessfulDagRunResponse(
+                data_interval_start=earlier_run.data_interval_start,
+                data_interval_end=earlier_run.data_interval_end,
+                start_date=earlier_run.start_date,
+                end_date=earlier_run.end_date,
+            )
+        else:
+            assert workload.previous_successful_dag_run is None
         log_path = jobless_supervisor.logger_cache[callback_trigger.id].log_path
         assert (
             log_path
@@ -1241,6 +1264,12 @@ async def test_create_triggers_sets_callback_context_from_dag_run_data(mock_get_
             encrypted_kwargs=Trigger.encrypt_kwargs({"callback_path": "x.y", "callback_kwargs": {}}),
             dag_run_data=dag_run_data,
             dag_data=dag_data,
+            previous_successful_dag_run=PrevSuccessfulDagRunResponse(
+                data_interval_start=timezone.datetime(2024, 6, 13),
+                data_interval_end=timezone.datetime(2024, 6, 14),
+                start_date=timezone.datetime(2024, 6, 14, 1),
+                end_date=timezone.datetime(2024, 6, 14, 2),
+            ),
         )
     )
 
@@ -1250,6 +1279,10 @@ async def test_create_triggers_sets_callback_context_from_dag_run_data(mock_get_
     assert len(injected_instances) == 1
     context = injected_instances[0]._callback_context
     assert context is not None
+    assert context["prev_data_interval_start_success"] == timezone.datetime(2024, 6, 13)
+    assert context["prev_data_interval_end_success"] == timezone.datetime(2024, 6, 14)
+    assert context["prev_start_date_success"] == timezone.datetime(2024, 6, 14, 1)
+    assert context["prev_end_date_success"] == timezone.datetime(2024, 6, 14, 2)
     assert context["run_id"] == "ctx_run"
     assert context["ds"] == "2024-06-15"
     assert context["deadline"] == {"id": "abc", "deadline_time": timezone.datetime(2024, 6, 15, 13)}

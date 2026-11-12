@@ -34,20 +34,23 @@ import structlog
 from pydantic import Field, TypeAdapter
 
 from airflow.sdk._shared.module_loading import UNUSUAL_MODULE_PREFIX, accepts_context, accepts_keyword_args
-from airflow.sdk.api.datamodels._generated import CallbackTerminalState
-from airflow.sdk.exceptions import ErrorType
+from airflow.sdk.api.datamodels._generated import CallbackTerminalState, PrevSuccessfulDagRunResponse
+from airflow.sdk.exceptions import AirflowRuntimeError, ErrorType
 from airflow.sdk.execution_time.comms import (
     DagRunResult,
     ErrorResponse,
     GetConnection,
     GetDagRun,
+    GetPreviousDagRun,
     GetVariable,
     GetVariableKeys,
     GetXCom,
     MaskSecret,
+    PreviousDagRunResult,
 )
 from airflow.sdk.execution_time.request_handlers import (
     handle_get_connection,
+    handle_get_previous_dag_run,
     handle_get_variable,
     handle_get_variable_keys,
     handle_get_xcom,
@@ -88,7 +91,7 @@ log: FilteringBoundLogger = structlog.get_logger(logger_name="callback_superviso
 # This is a minimal subset of ToSupervisor: read-only access to Connections,
 # Variables, XCom values and the callback's Dag run, plus MaskSecret for the secrets masker.
 CallbackToSupervisor = Annotated[
-    GetConnection | GetDagRun | GetVariable | GetVariableKeys | GetXCom | MaskSecret,
+    GetConnection | GetDagRun | GetPreviousDagRun | GetVariable | GetVariableKeys | GetXCom | MaskSecret,
     Field(discriminator="type"),
 ]
 
@@ -381,12 +384,38 @@ class CallbackSubprocess(WatchedSubprocess):
                         "Could not fetch the Dag run for the callback context", dag_id=dag_id, run_id=run_id
                     )
                     sys.exit(1)
+                previous_successful_dag_run = None
+                if dag_run.logical_date is not None:
+                    try:
+                        previous_result = task_runner.SUPERVISOR_COMMS.send(
+                            GetPreviousDagRun(
+                                dag_id=dag_run.dag_id,
+                                logical_date=dag_run.logical_date,
+                                state="success",
+                            )
+                        )
+                    except AirflowRuntimeError:
+                        _log.warning(
+                            "Could not fetch the previous successful Dag run for the callback context",
+                            dag_id=dag_run.dag_id,
+                            run_id=dag_run.run_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if not isinstance(previous_result, PreviousDagRunResult):
+                            raise TypeError(f"Unexpected response type {type(previous_result).__name__}")
+                        if previous_result.dag_run is not None:
+                            previous_successful_dag_run = PrevSuccessfulDagRunResponse.model_validate(
+                                previous_result.dag_run,
+                                from_attributes=True,
+                            )
                 context = build_deadline_callback_context(
                     dag_run,
                     _parse_callback_dag(dag_id, dag_rel_path, bundle_path, bundle_info, _log),
                     deadline_id=deadline_id,
                     deadline_time=deadline_time,
                     multi_team=conf.getboolean("core", "multi_team", fallback=False),
+                    previous_successful_dag_run=previous_successful_dag_run,
                 )
                 kwargs = {**callback_kwargs, "context": context}
 
@@ -512,6 +541,8 @@ class CallbackSubprocess(WatchedSubprocess):
             resp, dump_opts = handle_get_connection(self.client, msg)
         elif isinstance(msg, GetDagRun):
             resp = DagRunResult.from_api_response(self.client.dag_runs.get_detail(msg.dag_id, msg.run_id))
+        elif isinstance(msg, GetPreviousDagRun):
+            resp, dump_opts = handle_get_previous_dag_run(self.client, msg)
         elif isinstance(msg, GetVariable):
             resp, dump_opts = handle_get_variable(self.client, msg)
         elif isinstance(msg, GetVariableKeys):
